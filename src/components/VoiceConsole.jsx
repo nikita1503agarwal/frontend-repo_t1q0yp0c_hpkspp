@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { Mic, Square, Volume2, VolumeX, Zap } from 'lucide-react';
 
+// Compute backend URL: use env if provided, otherwise default to same host on port 8000
+const DEFAULT_BACKEND = (typeof window !== 'undefined')
+  ? `${window.location.protocol}//${window.location.hostname}:8000`
+  : '';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || DEFAULT_BACKEND;
+
 // Simple intent matcher to make Jarvis respond without a backend
-function getResponse(input) {
+function getLocalResponse(input) {
   const text = input.toLowerCase();
   const now = new Date();
 
@@ -12,9 +18,7 @@ function getResponse(input) {
   if (/date|day/.test(text)) return `Today is ${now.toLocaleDateString()}.`;
   if (/open (settings|preferences)/.test(text)) return "Opening settings. (This is a demo action.)";
   if (/help|what can you do/.test(text)) return "You can ask for time, date, or say hello. More skills coming soon.";
-
-  // Default fallback echoes the last command briefly
-  return `Got it: ${input.trim()}`;
+  return null; // let AI handle unknowns
 }
 
 export default function VoiceConsole() {
@@ -22,7 +26,11 @@ export default function VoiceConsole() {
   const [transcript, setTranscript] = useState('');
   const [lastResponse, setLastResponse] = useState('');
   const [ttsEnabled, setTtsEnabled] = useState(true);
+  const [useAI] = useState(true);
+
   const recognitionRef = useRef(null);
+  const isSpeakingRef = useRef(false);
+  const resumeAfterSpeakRef = useRef(false);
 
   // Initialize SpeechRecognition once
   useEffect(() => {
@@ -35,16 +43,18 @@ export default function VoiceConsole() {
     recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
+      // If TTS is currently speaking, ignore mic input to prevent feedback loops
+      if (isSpeakingRef.current) return;
+
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const res = event.results[i];
         const text = res[0].transcript;
         if (res.isFinal) {
           const finalText = text.trim();
+          if (!finalText) continue;
           setTranscript((prev) => (prev + ' ' + finalText).trim());
-          const reply = getResponse(finalText);
-          setLastResponse(reply);
-          speak(reply);
+          handleResponse(finalText);
         } else {
           interim += text;
         }
@@ -54,20 +64,86 @@ export default function VoiceConsole() {
     };
 
     recognition.onend = () => {
-      if (listening) recognition.start();
+      // Auto-restart only if still listening and not paused due to TTS
+      if (listening && !isSpeakingRef.current) {
+        try { recognition.start(); } catch (_) {}
+      }
     };
 
     recognitionRef.current = recognition;
   }, [listening]);
 
+  const handleResponse = async (finalText) => {
+    // 1) Try local intents first
+    const local = getLocalResponse(finalText);
+    if (local) {
+      setLastResponse(local);
+      speak(local);
+      return;
+    }
+
+    // 2) Otherwise call backend Gemini if enabled
+    if (useAI && BACKEND_URL) {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/jarvis`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: finalText })
+        });
+        const data = await res.json();
+        const reply = data?.reply || "";
+        if (reply) {
+          setLastResponse(reply);
+          speak(reply);
+          return;
+        }
+      } catch (e) {
+        console.error('Gemini error', e);
+      }
+    }
+
+    // 3) Fallback echo
+    const echo = `Got it: ${finalText}`;
+    setLastResponse(echo);
+    speak(echo);
+  };
+
   const speak = (text) => {
     if (!ttsEnabled) return;
     if (!('speechSynthesis' in window)) return;
+
+    const r = recognitionRef.current;
+    // Mark as speaking BEFORE stopping recognition to avoid race where onend restarts
+    isSpeakingRef.current = true;
+
+    // Remember if we should resume listening after speaking
+    resumeAfterSpeakRef.current = !!(r && listening);
+
+    // Stop listening while speaking to avoid self-hearing loops
+    if (r && listening) {
+      try { r.stop(); } catch (_) {}
+    }
+
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = 'en-US';
     utter.rate = 1.0;
     utter.pitch = 1.0;
-    window.speechSynthesis.cancel();
+
+    utter.onend = () => {
+      // speaking finished
+      // Small delay before resuming to let microphones settle
+      if (resumeAfterSpeakRef.current && r) {
+        setTimeout(() => {
+          isSpeakingRef.current = false;
+          if (!listening) return; // user might have stopped meanwhile
+          try { r.start(); } catch (_) {}
+        }, 250);
+      } else {
+        isSpeakingRef.current = false;
+      }
+    };
+
+    try { window.speechSynthesis.cancel(); } catch (_) {}
     window.speechSynthesis.speak(utter);
   };
 
@@ -75,19 +151,22 @@ export default function VoiceConsole() {
     const r = recognitionRef.current;
     if (!r) return;
     if (listening) {
-      r.stop();
+      try { r.stop(); } catch (_) {}
       setListening(false);
+      // Also stop any ongoing speech
+      if (window.speechSynthesis) try { window.speechSynthesis.cancel(); } catch (_) {}
+      isSpeakingRef.current = false;
     } else {
       setTranscript('');
       setLastResponse('');
-      r.start();
+      try { r.start(); } catch (_) {}
       setListening(true);
     }
   };
 
   const toggleTts = () => {
     setTtsEnabled((v) => !v);
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    if (window.speechSynthesis) try { window.speechSynthesis.cancel(); } catch (_) {}
   };
 
   const recognitionSupported = typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -149,7 +228,7 @@ export default function VoiceConsole() {
               </button>
             </div>
             <div className="mt-2 flex items-center justify-center gap-1 text-xs text-cyan-100/70">
-              {listening ? 'Listening…' : 'Idle'}
+              {listening ? (isSpeakingRef.current ? 'Speaking…' : 'Listening…') : 'Idle'}
             </div>
           </div>
         </div>
